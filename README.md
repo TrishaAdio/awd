@@ -1,118 +1,126 @@
-# Yor chat-exporter userbot
+# Yor training-data extractor userbot
 
-A tiny **Telethon userbot** that runs on *your* Telegram account. You DM it a
-chat id (in your Saved Messages by default) and in seconds it extracts the whole
-chat history and writes a **feed-ready datasheet** the yor-assistant can eat —
-plus a structured JSONL for any other AI pipeline.
+A **Telethon userbot** that runs on *your* Telegram account. You register the
+**girls** (whose messages become Yor's voice — the assistant turns), point it at
+a chat, and it builds `prompt -> response` training pairs where the response is
+always a girl:
 
 ```
-you (Saved Messages):  .export -1001234567890
-        │
-        ▼
-userbot iter_messages(entity)  ── fast, batched history pull
-        │
-        ├─►  <FEED_DIR>/chat_<id>_<slug>.md      ← feed datasheet (point FEED_DIR at knowledge/feed to auto-index)
-        └─►  <EXPORT_DIR>/chat_<id>_<slug>.jsonl ← structured records
+boy  -> girl    someone NOT in the girls set asks, a girl answers
+girl -> girl    a girl asks, a different girl answers
+boy  -> boy     never produced (the response must be a girl)
 ```
 
-## Why this format?
+It then drops the resulting `.jsonl` back into the chat with an
+`extracted successfully` note.
 
-The yor-assistant indexes every `*.md`/`*.txt` in its `knowledge/feed/`. Its
-chunker (`knowledge.py`) splits a feed doc on blank lines and keeps any block of
-320 characters or fewer whole. So the exporter writes **one message per
-blank-line-separated block**, giving the retriever clean, self-contained chunks:
-
-```markdown
-# Chat export — Night Owls (-1001234567890)
-
-> Feed doc for the yor-assistant. Source: supergroup -1001234567890. Exported 2026-07-02 12:00 UTC. 3 messages.
-
-## Conversation
-
-[2026-07-01 18:04] Alice: the meetup is Friday at 6pm, bring your laptop
-
-[2026-07-01 18:05] Bob: sounds good, I'll drive
-
-[2026-07-01 18:06] Alice: parking is free after 5
+```
+you:  /addids 111 222 333          register the girls (persisted)
+you:  /export -1001234567890       build pairs from a group
+       │
+       ▼
+iter_messages -> pair by reply-link or nearest message within the window
+       │
+       └─►  exports/yor_group_<id>.jsonl   ← uploaded back into the chat
 ```
 
-Drop it in `knowledge/feed/` (the exporter does this for you) and it is indexed
-on the assistant's next load — no code changes.
+## Login (interactive)
 
-**Text only:** media messages (photos, voice notes, video, stickers,
-documents) and service messages (joins, pins) are dropped — only messages with
-actual text are exported.
+Start the bot and it asks, in the terminal, for everything it needs:
 
-The JSONL mirror is one object per message for embeddings / fine-tuning:
-
-```json
-{"id": 42, "date": "2026-07-01T18:04:00+00:00", "sender": "Alice", "sender_id": 111, "text": "the meetup is Friday...", "reply_to": null}
+```bash
+pip install -r requirements.txt
+cp .env.example .env        # optional: pre-fill API_ID / API_HASH / PHONE
+python exporter.py
 ```
 
-## Setup
+Prompts:
+- **API ID** and **API hash** — from <https://my.telegram.org> → *API development tools* (or set them in `.env`).
+- **Phone number** — your account's number.
+- **OTP code** — the login code Telegram sends you.
+- **2FA password** — only if your account has one (leave blank otherwise).
 
-1. Get `API_ID` and `API_HASH` from <https://my.telegram.org> → *API development tools*.
-2. Install and configure:
+The session is cached in a `.session` file so you only log in once. You can also
+mint a portable string session with `python exporter.py --gen-session`.
 
-   ```bash
-   pip install -r requirements.txt
-   cp .env.example .env      # then fill in API_ID / API_HASH
-   ```
+## Access control
 
-3. (Optional) generate a portable string session instead of a `.session` file:
+Only **allowed users** can command the bot. The account owner is always allowed;
+add more ids with `ALLOWED_USERS` in `.env`. Commands from anyone else are
+ignored.
 
-   ```bash
-   python exporter.py --gen-session   # logs in once, prints STRING_SESSION
-   ```
-
-4. Start it:
-
-   ```bash
-   python exporter.py
-   ```
-
-The first run asks for your phone number + login code (Telethon standard).
-
-## Using it
-
-Send these to your **Saved Messages** (or whatever `CONTROL_CHAT` you set):
+## Commands
 
 | Command | What it does |
 |---|---|
-| `.export -1001234567890` | export a whole chat by id |
-| `.export @publicgroup 500` | export the last 500 messages |
-| `.export https://t.me/group` | a public t.me link works too |
-| `-1001234567890` | a bare id / `@username` / link on its own also exports |
-| `.cancel` | stop a running export |
-| `.help` | show help |
+| `/addids <id> <id> ...` | register girls (accepts `111`, `-100…`, or the export-style `user123456789`) |
+| `/rmids <id> ...` | unregister ids |
+| `/ids` | show the current girls set |
+| `/clearids` | clear the set |
+| `/export <chat> [limit]` | build pairs from a chat (`id` / `@username` / `t.me` link); `limit` caps pairs |
+| `/cancel` | stop a running export |
+| `/help` | help |
 
-When it finishes it edits the status message with the paths and (by default)
-uploads both files back to your chat.
+The girls set is stored in `girls.json` and survives restarts.
 
-### Getting a chat id
+## Output format
 
-Yor's own `/id` command returns chat ids, or forward a message from the chat to
-a userinfo bot. Group/supergroup ids are negative (often `-100…`).
+Default `OUTPUT_FORMAT=messages` — OpenAI-style chat, the girl is the assistant
+turn (optionally prefixed with a system prompt):
 
-## Configuration (`.env`)
+```json
+{"messages": [{"role": "user", "content": "are you two free this weekend?"}, {"role": "assistant", "content": "yeah friday works for me totally"}]}
+```
+
+Set `OUTPUT_FORMAT=prompt_response` for `{"prompt": ..., "response": ...}` records.
+
+Combine with your curated persona set and train, e.g.:
+
+```bash
+cat data/yor_waifu.jsonl exports/yor_group_-1001234567890.jsonl > data/yor_all.jsonl
+BASE_MODEL=~/models/qwen2.5-3b DATA_FILE=data/yor_all.jsonl EPOCHS=12 python main.py
+```
+
+Keep the group slice a minority vs. the curated lines so Yor stays Yor while
+picking up how the girls actually talk.
+
+## Pairing & filtering
+
+- **Prompt selection:** Telegram's reply-link when present, else the most recent
+  different-author message within `PAIR_WINDOW` seconds.
+- **Filters** (applied to both prompt and response): `MIN_WORDS`, `MAX_CHARS`,
+  `DROP_LINK_MSGS`. Same-author self-pairs are skipped.
+- **PII scrub:** emails and phone-number-like digit runs are stripped from the
+  emitted text.
+- **Sampling:** when more pairs than `PAIR_LIMIT` are found and `SAMPLE=true`,
+  a random sample is taken.
+
+## Config (`.env`)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `API_ID`, `API_HASH` | — | your Telegram app credentials (required) |
-| `SESSION_NAME` | `yor_exporter` | file session name |
+| `API_ID`, `API_HASH` | *(prompted)* | Telegram app credentials |
+| `PHONE` | *(prompted)* | phone number for login |
 | `STRING_SESSION` | *(empty)* | use a string session instead of a file |
-| `CONTROL_CHAT` | `me` | where it listens: `me` (Saved Messages) or a user id |
-| `PREFIX` | `.` | command prefix |
-| `FEED_DIR` | `./feed` | where the feed datasheet is written (point at your yor-assistant `knowledge/feed` to auto-index) |
-| `EXPORT_DIR` | `./exports` | where the JSONL is written |
-| `DEFAULT_LIMIT` | `0` | default max messages (`0` = whole history) |
-| `SEND_FILES_BACK` | `true` | upload the files back to the control chat |
+| `ALLOWED_USERS` | *(empty)* | extra user ids allowed to command the bot |
+| `PREFIX` | `/` | command prefix |
+| `GIRLS_FILE` | `./girls.json` | where the girls set is stored |
+| `FETCH_LIMIT` | `0` | messages to pull before pairing (`0` = all) |
+| `PAIR_LIMIT` | `500` | max pairs emitted per export |
+| `MIN_WORDS` | `3` | drop messages under this many words |
+| `MAX_CHARS` | `300` | drop messages over this many chars |
+| `PAIR_WINDOW` | `600` | seconds for time-window pairing |
+| `DROP_LINK_MSGS` | `true` | drop messages containing links |
+| `SAMPLE` | `true` | random-sample when over `PAIR_LIMIT` |
+| `OUTPUT_FORMAT` | `messages` | `messages` or `prompt_response` |
+| `SYSTEM_PROMPT` | *(empty)* | system prompt added to each `messages` record |
+| `EXPORT_DIR` | `./exports` | where the `.jsonl` is written |
 
 ## Notes & safety
 
-- This is a **userbot**: it acts as you, over MTProto. Only you (the control
-  chat) can command it. Keep your `.session` / `STRING_SESSION` private.
+- This is a **userbot**: it acts as you over MTProto. Keep your `.session` /
+  `STRING_SESSION` and `girls.json` private (all are git-ignored).
 - You can only export chats **your account can already read**.
-- Only **text messages** are exported; media and service messages are skipped.
-- Respect Telegram's Terms of Service and the privacy of the people in the
-  chats you export.
+- Text messages only; media and service messages are skipped.
+- Respect Telegram's Terms of Service and the privacy of the people whose
+  messages you extract.

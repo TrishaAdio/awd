@@ -2,5 +2,7 @@
 *.session-journal
 .env
 exports/
+feed/
+girls.json
 __pycache__/
 *.pyc

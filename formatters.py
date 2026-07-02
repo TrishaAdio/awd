@@ -1,31 +1,25 @@
 """
-Export formatters for the Yor chat-exporter userbot.
+Formatters for the Yor extractor userbot.
 
-Turns extracted Telegram messages into two artifacts:
+Primary path — **training-pair extraction** (see build_training_pairs):
+turns a chronological message list into prompt -> response records where the
+response is always authored by a "girl", so girls become Yor's assistant turns.
 
-  1. A **feed-ready Markdown datasheet** — the format the yor-assistant actually
-     eats. The assistant's chunker (knowledge.py) splits feed docs on blank
-     lines, keeps any block <= 320 chars whole, and strips HTML tags. So every
-     message becomes its own self-contained, blank-line-separated block:
+Secondary path — a **feed-ready Markdown datasheet** + per-message JSONL
+(build_feed_doc / build_jsonl), kept for retrieval-style feeding of a chat's
+whole text into an assistant.
 
-         [2024-05-01 14:23] Alice: the event starts at 6pm on Friday
-
-     Drop the file in knowledge/feed/ and it is auto-indexed. No code changes.
-
-  2. A **structured JSONL** — one JSON object per message (id, date, sender,
-     sender_id, reply_to, text). For general AI use: embeddings, fine tuning,
-     or your own pipeline.
-
-Text only: media messages (photos, voice, video, stickers, documents ...) are
-dropped entirely; only messages with actual text survive.
+Text only: media messages are dropped upstream; only text survives here.
 
 This module is deliberately free of Telethon imports so it can be unit-tested
 with plain objects.
 """
 from __future__ import annotations
 
+import datetime as dt
 import io
 import json
+import random
 import re
 from dataclasses import dataclass, asdict, field
 
@@ -112,3 +106,158 @@ def feed_filename(meta: dict) -> str:
 
 def jsonl_filename(meta: dict) -> str:
     return f"chat_{meta.get('chat_id', 'unknown')}_{slugify(meta.get('title', ''))}.jsonl"
+
+
+
+# --------------------------------------------------------------------------- #
+# Training-pair extraction (girls == Yor's voice / assistant turns)
+#
+# We turn a chronological message list into prompt -> response pairs where the
+# RESPONSE is always authored by a "girl" (an id in the girls set). The prompt
+# is whoever they were answering:
+#
+#   boy  -> girl   (prompt author NOT in girls)   ... a "cross" pair
+#   girl -> girl   (prompt author IS  in girls, but a different person)
+#
+# Because the response must be a girl, boy -> boy pairs can never appear.
+# Pairing uses Telegram's reply-link when present, else the most recent
+# different-author message within `window` seconds.
+# --------------------------------------------------------------------------- #
+
+_URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)\S+", re.I)
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+# 7+ digit runs (optionally +, spaces, dashes) -> looks like a phone number
+_PHONE_RE = re.compile(r"(?<!\w)\+?\d[\d\s\-]{6,}\d(?!\w)")
+
+
+def scrub_pii(text: str) -> str:
+    """Light PII scrub: strip emails and phone-number-like digit runs."""
+    text = _EMAIL_RE.sub("", text)
+    text = _PHONE_RE.sub("", text)
+    return _WS.sub(" ", text).strip()
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+def _epoch(iso: str) -> float | None:
+    if not iso:
+        return None
+    try:
+        return dt.datetime.fromisoformat(iso).timestamp()
+    except Exception:
+        return None
+
+
+def passes_filters(text: str, *, min_words: int, max_chars: int,
+                   drop_links: bool) -> bool:
+    """Quality gate for a single message (applied to prompt AND response)."""
+    clean = clean_text(text)
+    if not clean:
+        return False
+    if drop_links and _URL_RE.search(clean):
+        return False
+    if _word_count(clean) < min_words:
+        return False
+    if len(clean) > max_chars:
+        return False
+    return True
+
+
+def _to_record(prompt: str, response: str, *, output_format: str,
+               system_prompt: str) -> dict:
+    if output_format == "prompt_response":
+        return {"prompt": prompt, "response": response}
+    # default: OpenAI-style chat "messages" (girl == assistant turn)
+    msgs = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
+    msgs.append({"role": "user", "content": prompt})
+    msgs.append({"role": "assistant", "content": response})
+    return {"messages": msgs}
+
+
+def build_training_pairs(
+    messages: list[Msg],
+    girl_ids: set[int],
+    *,
+    window: int = 600,
+    min_words: int = 3,
+    max_chars: int = 300,
+    drop_links: bool = True,
+    limit: int = 500,
+    sample: bool = True,
+    system_prompt: str = "",
+    output_format: str = "messages",
+    seed: int | None = None,
+) -> tuple[list[dict], dict]:
+    """Build prompt->response pairs where the response author is a girl.
+
+    `messages` must be chronological (oldest first). Returns (records, stats).
+    """
+    girl_ids = {int(g) for g in girl_ids}
+    by_id = {m.id: m for m in messages}
+    filt = dict(min_words=min_words, max_chars=max_chars, drop_links=drop_links)
+
+    pairs: list[tuple[Msg, Msg]] = []
+    for i, resp in enumerate(messages):
+        if resp.sender_id not in girl_ids:
+            continue
+        if not passes_filters(resp.text, **filt):
+            continue
+
+        prompt = None
+        # 1) explicit reply-link
+        if resp.reply_to and resp.reply_to in by_id:
+            cand = by_id[resp.reply_to]
+            if cand.sender_id != resp.sender_id and passes_filters(cand.text, **filt):
+                prompt = cand
+        # 2) most recent different-author message within the time window
+        if prompt is None:
+            ts_r = _epoch(resp.date)
+            for j in range(i - 1, -1, -1):
+                cand = messages[j]
+                ts_c = _epoch(cand.date)
+                if ts_r is not None and ts_c is not None and (ts_r - ts_c) > window:
+                    break
+                if cand.sender_id == resp.sender_id:
+                    continue
+                if not passes_filters(cand.text, **filt):
+                    continue
+                prompt = cand
+                break
+        if prompt is not None:
+            pairs.append((prompt, resp))
+
+    cross = sum(1 for p, _ in pairs if p.sender_id not in girl_ids)
+    same = len(pairs) - cross
+
+    if sample:
+        rng = random.Random(seed)
+        rng.shuffle(pairs)
+    if limit and limit > 0:
+        pairs = pairs[:limit]
+
+    records = [
+        _to_record(
+            scrub_pii(clean_text(p.text)),
+            scrub_pii(clean_text(r.text)),
+            output_format=output_format,
+            system_prompt=system_prompt,
+        )
+        for p, r in pairs
+    ]
+    stats = {
+        "girls": len(girl_ids),
+        "pairs_total": cross + same,
+        "boy_to_girl": cross,
+        "girl_to_girl": same,
+        "emitted": len(records),
+    }
+    return records, stats
+
+
+def records_to_jsonl(records: list[dict]) -> str:
+    lines = [json.dumps(r, ensure_ascii=False) for r in records]
+    return "\n".join(lines) + ("\n" if lines else "")
