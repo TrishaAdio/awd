@@ -2,24 +2,29 @@
 """
 Yor training-data extractor userbot (Telethon).
 
-Runs on YOUR Telegram account. You register the "girls" (whose messages become
-Yor's voice / the assistant turns), then point it at a chat. It extracts
-prompt -> response pairs where the RESPONSE is always a girl:
+Runs on YOUR Telegram account. Add it to a group, then an allowed user
+registers the target users (whose messages become Yor's voice / the assistant
+turns) right in that group:
 
-    boy  -> girl   (someone not in the girls set asks, a girl answers)
-    girl -> girl   (a girl asks, a different girl answers)
+    /addusers 8339524472 6615872523 7558095919 ...
 
-Because the response must be a girl, boy -> boy pairs never appear. It drops the
-resulting .jsonl back into the chat with an "extracted successfully" note.
+That both registers the ids and immediately extracts the current group into
+prompt -> response pairs where the RESPONSE is always one of those users:
 
-Commands (send from an allowed account, default = you):
-    /addids 12345 user678 ...   register girl ids (accepts "user123" too)
-    /rmids 12345 ...            unregister ids
-    /ids                        show the current girls set
-    /clearids                   clear the set
-    /export <chat> [limit]      build pairs from a chat (id / @username / link)
-    /cancel                     stop a running export
-    /help                       show help
+    other -> target    someone else asks, a target user answers
+    target -> target   a target asks, a different target answers
+
+other -> other is never produced. The resulting file is dropped back into the
+chat with a per-user stats caption (chat totals + total tokens extracted).
+
+Commands (from an allowed account; the owner is always allowed):
+    /addusers <id> <id> ...   register targets and extract this chat
+    /rmusers <id> ...          unregister ids
+    /users                     show the registered set
+    /clearusers                clear the set
+    /export <chat> [limit]     extract a specific chat instead of the current one
+    /cancel                    stop a running extraction
+    /help                      help
 
 CLI:
     python exporter.py              start the userbot (interactive login)
@@ -33,7 +38,6 @@ import getpass
 import json
 import os
 import sys
-import time
 
 try:
     from dotenv import load_dotenv
@@ -83,6 +87,7 @@ PAIR_WINDOW = int(_env("PAIR_WINDOW", "600") or 600)  # seconds
 DROP_LINK_MSGS = str(_env("DROP_LINK_MSGS", "true")).lower() in ("1", "true", "yes")
 SAMPLE = str(_env("SAMPLE", "true")).lower() in ("1", "true", "yes")
 OUTPUT_FORMAT = _env("OUTPUT_FORMAT", "messages")     # messages | prompt_response
+OUTPUT_EXT = _env("OUTPUT_EXT", "txt").lstrip(".")    # sent file extension
 SYSTEM_PROMPT = _env("SYSTEM_PROMPT", "")
 
 _BUSY = {"running": False, "cancel": False}
@@ -173,9 +178,42 @@ async def extract_chat(client, entity, limit, progress=None):
     return messages
 
 
+_NAME_CACHE: dict[int, str] = {}
+
+
+async def _safe_name(client, uid) -> str:
+    if uid in _NAME_CACHE:
+        return _NAME_CACHE[uid]
+    try:
+        ent = await client.get_entity(uid)
+        name = _display_name(ent)
+    except Exception:
+        name = f"user {uid}"
+    _NAME_CACHE[uid] = name
+    return name
+
+
+async def _stats_caption(client, messages, stats) -> str:
+    """Per-user chat totals + total tokens, in the requested style."""
+    totals: dict[int, int] = {}
+    for m in messages:
+        if m.sender_id in GIRLS:
+            totals[m.sender_id] = totals.get(m.sender_id, 0) + 1
+
+    lines = []
+    for uid in sorted(GIRLS, key=lambda u: totals.get(u, 0), reverse=True)[:25]:
+        name = await _safe_name(client, uid)
+        lines.append(f"user {name} chat total : {totals.get(uid, 0)}")
+    if len(GIRLS) > 25:
+        lines.append(f"(+{len(GIRLS) - 25} more users)")
+    lines.append(f"total tokens extracted : {stats['tokens']}")
+    lines.append("thanks for data")
+    return "\n".join(lines)
+
+
 async def do_export(client, status_msg, target_raw, pair_limit):
     if not GIRLS:
-        await status_msg.edit(f"No girls registered. Add ids first: {PREFIX}addids <id> <id> ...")
+        await status_msg.edit(f"No users registered. Add ids first: {PREFIX}addusers <id> <id> ...")
         return
 
     target = _parse_target(target_raw)
@@ -187,11 +225,10 @@ async def do_export(client, status_msg, target_raw, pair_limit):
 
     title = _display_name(entity)
     chat_id = getattr(entity, "id", target)
-    await status_msg.edit(f"Extracting {title} ({chat_id}) ...")
-    started = time.monotonic()
+    await status_msg.edit(f"Extracting {title} ...")
 
     async def progress(n):
-        await status_msg.edit(f"Extracting {title} ({chat_id}) ... {n} messages")
+        await status_msg.edit(f"Extracting {title} ... {n} messages")
 
     messages = await extract_chat(client, entity, FETCH_LIMIT, progress)
     if _BUSY["cancel"]:
@@ -207,47 +244,58 @@ async def do_export(client, status_msg, target_raw, pair_limit):
     jsonl = formatters.records_to_jsonl(records)
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
-    out_path = os.path.join(EXPORT_DIR, f"yor_group_{chat_id}.jsonl")
+    out_path = os.path.join(EXPORT_DIR, f"yor_{chat_id}.{OUTPUT_EXT}")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(jsonl)
 
-    took = time.monotonic() - started
-    caption = (
-        f"Extracted successfully — {stats['emitted']} pairs from {title}.\n"
-        f"boy->girl {stats['boy_to_girl']} · girl->girl {stats['girl_to_girl']} · "
-        f"girls {stats['girls']} · {took:.1f}s"
-    )
-
-    if records:
-        try:
-            await client.send_file(status_msg.chat_id, out_path, caption=caption,
-                                   force_document=True)
-            await status_msg.delete()
-        except Exception as e:
-            await status_msg.edit(f"{caption}\n(saved to {out_path}; upload failed: {e})")
-    else:
+    if not records:
         await status_msg.edit(
-            f"No pairs matched. {stats['pairs_total']} candidate girl replies found "
-            f"but none passed the filters (min_words {MIN_WORDS}, max_chars {MAX_CHARS})."
+            f"No pairs matched. {stats['pairs_total']} candidate replies found but "
+            f"none passed the filters (min_words {MIN_WORDS}, max_chars {MAX_CHARS})."
         )
+        return
+
+    caption = await _stats_caption(client, messages, stats)
+    try:
+        await client.send_file(status_msg.chat_id, out_path, caption=caption,
+                               force_document=True)
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit(f"{caption}\n(saved to {out_path}; upload failed: {e})")
 
 
 HELP_TEXT = (
     "Yor training extractor\n\n"
-    f"{PREFIX}addids <id> <id> ...  register girls (accepts user123 form)\n"
-    f"{PREFIX}rmids <id> ...         unregister ids\n"
-    f"{PREFIX}ids                    show the girls set\n"
-    f"{PREFIX}clearids               clear the set\n"
-    f"{PREFIX}export <chat> [limit]  build pairs (id / @username / t.me link)\n"
-    f"{PREFIX}cancel                 stop a running export\n\n"
-    "Response turns come only from the girls (boy->girl and girl->girl); "
-    "boy->boy is never produced. Output: a training .jsonl dropped here."
+    f"{PREFIX}addusers <id> <id> ...  register target users and extract this chat\n"
+    f"{PREFIX}rmusers <id> ...         unregister ids\n"
+    f"{PREFIX}users                    show the registered users\n"
+    f"{PREFIX}clearusers               clear the set\n"
+    f"{PREFIX}export <chat> [limit]    extract a specific chat (id / @username / link)\n"
+    f"{PREFIX}cancel                   stop a running extraction\n\n"
+    "Add the bot to a group, then /addusers the ids there. Reply turns come only "
+    "from those users (others -> them, and them -> each other); never other->other."
 )
 
 
 # --------------------------------------------------------------------------- #
 # Command handling
 # --------------------------------------------------------------------------- #
+async def run_export(client, event, target_raw, pair_limit):
+    if _BUSY["running"]:
+        await event.reply(f"An extraction is already running. Send {PREFIX}cancel first.")
+        return
+    _BUSY["running"] = True
+    _BUSY["cancel"] = False
+    status = await event.reply("Starting ...")
+    try:
+        await do_export(client, status, target_raw, pair_limit)
+    except Exception as e:
+        await status.edit(f"Extraction failed: {e}")
+    finally:
+        _BUSY["running"] = False
+        _BUSY["cancel"] = False
+
+
 async def _handle(event, client, allowed_ids):
     if event.sender_id not in allowed_ids:
         return
@@ -262,7 +310,7 @@ async def _handle(event, client, allowed_ids):
         await event.reply(HELP_TEXT)
         return
 
-    if cmd == "addids":
+    if cmd in ("addusers", "addids"):
         added = []
         for tok in args:
             gid = _parse_id_token(tok)
@@ -270,10 +318,14 @@ async def _handle(event, client, allowed_ids):
                 GIRLS.add(gid)
                 added.append(gid)
         save_girls(GIRLS)
-        await event.reply(f"Girls: {len(GIRLS)} ids ({len(added)} added)\n" + _ids_block())
+        if not GIRLS:
+            await event.reply(f"Usage: {PREFIX}addusers <id> <id> ...")
+            return
+        # register, then immediately extract THIS chat
+        await run_export(client, event, str(event.chat_id), PAIR_LIMIT)
         return
 
-    if cmd == "rmids":
+    if cmd in ("rmusers", "rmids"):
         removed = []
         for tok in args:
             gid = _parse_id_token(tok)
@@ -281,17 +333,17 @@ async def _handle(event, client, allowed_ids):
                 GIRLS.discard(gid)
                 removed.append(gid)
         save_girls(GIRLS)
-        await event.reply(f"Girls: {len(GIRLS)} ids ({len(removed)} removed)\n" + _ids_block())
+        await event.reply(f"Users: {len(GIRLS)} ({len(removed)} removed)\n" + _ids_block())
         return
 
-    if cmd == "ids":
-        await event.reply(f"Girls: {len(GIRLS)} ids\n" + _ids_block())
+    if cmd in ("users", "ids"):
+        await event.reply(f"Users: {len(GIRLS)}\n" + _ids_block())
         return
 
-    if cmd == "clearids":
+    if cmd in ("clearusers", "clearids"):
         GIRLS.clear()
         save_girls(GIRLS)
-        await event.reply("Girls: 0 ids")
+        await event.reply("Users: 0")
         return
 
     if cmd == "cancel":
@@ -308,19 +360,7 @@ async def _handle(event, client, allowed_ids):
             return
         target_raw = args[0]
         limit = int(args[1]) if len(args) >= 2 and args[1].isdigit() else PAIR_LIMIT
-        if _BUSY["running"]:
-            await event.reply(f"An export is already running. Send {PREFIX}cancel first.")
-            return
-        _BUSY["running"] = True
-        _BUSY["cancel"] = False
-        status = await event.reply("Starting ...")
-        try:
-            await do_export(client, status, target_raw, limit)
-        except Exception as e:
-            await status.edit(f"Export failed: {e}")
-        finally:
-            _BUSY["running"] = False
-            _BUSY["cancel"] = False
+        await run_export(client, event, target_raw, limit)
         return
 
 

@@ -1,28 +1,38 @@
 # Yor training-data extractor userbot
 
-A **Telethon userbot** that runs on *your* Telegram account. You register the
-**girls** (whose messages become Yor's voice — the assistant turns), point it at
-a chat, and it builds `prompt -> response` training pairs where the response is
-always a girl:
+A **Telethon userbot** that runs on *your* Telegram account. Add it to a group,
+then an allowed user registers the **target users** (whose messages become Yor's
+voice — the assistant turns) right in that group. It extracts `prompt -> response`
+pairs where the response is always a target user:
 
 ```
-boy  -> girl    someone NOT in the girls set asks, a girl answers
-girl -> girl    a girl asks, a different girl answers
-boy  -> boy     never produced (the response must be a girl)
+other  -> target   someone NOT registered asks, a target user answers
+target -> target   a target asks, a different target answers
+other  -> other    never produced (the response must be a target user)
 ```
 
-It then drops the resulting `.jsonl` back into the chat with an
-`extracted successfully` note.
+The result is dropped back into the chat as a file, with a per-user stats
+caption.
 
 ```
-you:  /addids 111 222 333          register the girls (persisted)
-you:  /export -1001234567890       build pairs from a group
+(in your group)  /addusers 8339524472
+                            6615872523
+                            7558095919
        │
        ▼
-iter_messages -> pair by reply-link or nearest message within the window
+registers the ids AND immediately extracts THIS group
        │
-       └─►  exports/yor_group_<id>.jsonl   ← uploaded back into the chat
+       └─►  yor_<chatid>.txt  uploaded into the chat, caption:
+
+              user Priya chat total : 812
+              user Ananya chat total : 640
+              user Meera chat total : 291
+              total tokens extracted : 48120
+              thanks for data
 ```
+
+`chat total` is each user's message count in the chat; `total tokens extracted`
+is an approximate token count of the emitted training data.
 
 ## Login (interactive)
 
@@ -47,21 +57,23 @@ mint a portable string session with `python exporter.py --gen-session`.
 
 Only **allowed users** can command the bot. The account owner is always allowed;
 add more ids with `ALLOWED_USERS` in `.env`. Commands from anyone else are
-ignored.
+ignored — this matters because the bot sits in a group and reads everything.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/addids <id> <id> ...` | register girls (accepts `111`, `-100…`, or the export-style `user123456789`) |
-| `/rmids <id> ...` | unregister ids |
-| `/ids` | show the current girls set |
-| `/clearids` | clear the set |
-| `/export <chat> [limit]` | build pairs from a chat (`id` / `@username` / `t.me` link); `limit` caps pairs |
-| `/cancel` | stop a running export |
+| `/addusers <id> <id> ...` | register targets (ids on separate lines are fine) **and extract the current chat** |
+| `/rmusers <id> ...` | unregister ids |
+| `/users` | show the registered set |
+| `/clearusers` | clear the set |
+| `/export <chat> [limit]` | extract a specific chat instead of the current one (`id` / `@username` / `t.me` link) |
+| `/cancel` | stop a running extraction |
 | `/help` | help |
 
-The girls set is stored in `girls.json` and survives restarts.
+Ids accept plain `8339524472`, `-100…`, or the export-style `user8339524472`.
+The set is stored in `girls.json` and survives restarts. `/addids`, `/rmids`,
+`/ids` remain as aliases.
 
 ## Output format
 
@@ -77,7 +89,7 @@ Set `OUTPUT_FORMAT=prompt_response` for `{"prompt": ..., "response": ...}` recor
 Combine with your curated persona set and train, e.g.:
 
 ```bash
-cat data/yor_waifu.jsonl exports/yor_group_-1001234567890.jsonl > data/yor_all.jsonl
+cat data/yor_waifu.jsonl exports/yor_-1001234567890.txt > data/yor_all.jsonl
 BASE_MODEL=~/models/qwen2.5-3b DATA_FILE=data/yor_all.jsonl EPOCHS=12 python main.py
 ```
 
@@ -113,8 +125,9 @@ picking up how the girls actually talk.
 | `DROP_LINK_MSGS` | `true` | drop messages containing links |
 | `SAMPLE` | `true` | random-sample when over `PAIR_LIMIT` |
 | `OUTPUT_FORMAT` | `messages` | `messages` or `prompt_response` |
+| `OUTPUT_EXT` | `txt` | extension of the file sent to the chat (content is JSONL) |
 | `SYSTEM_PROMPT` | *(empty)* | system prompt added to each `messages` record |
-| `EXPORT_DIR` | `./exports` | where the `.jsonl` is written |
+| `EXPORT_DIR` | `./exports` | where the file is written |
 
 ## Notes & safety
 

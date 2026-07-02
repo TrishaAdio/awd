@@ -141,6 +141,11 @@ def _word_count(text: str) -> int:
     return len(text.split())
 
 
+def approx_tokens(text: str) -> int:
+    """Rough GPT-style token estimate (~4 chars/token)."""
+    return max(1, round(len(text) / 4)) if text else 0
+
+
 def _epoch(iso: str) -> float | None:
     if not iso:
         return None
@@ -239,21 +244,26 @@ def build_training_pairs(
     if limit and limit > 0:
         pairs = pairs[:limit]
 
+    prompts = [scrub_pii(clean_text(p.text)) for p, _ in pairs]
+    replies = [scrub_pii(clean_text(r.text)) for _, r in pairs]
     records = [
-        _to_record(
-            scrub_pii(clean_text(p.text)),
-            scrub_pii(clean_text(r.text)),
-            output_format=output_format,
-            system_prompt=system_prompt,
-        )
-        for p, r in pairs
+        _to_record(pr, rp, output_format=output_format, system_prompt=system_prompt)
+        for pr, rp in zip(prompts, replies)
     ]
+    tokens = sum(approx_tokens(pr) + approx_tokens(rp) for pr, rp in zip(prompts, replies))
+
+    by_user: dict[int, int] = {}
+    for _, r in pairs:
+        by_user[r.sender_id] = by_user.get(r.sender_id, 0) + 1
+
     stats = {
         "girls": len(girl_ids),
         "pairs_total": cross + same,
         "boy_to_girl": cross,
         "girl_to_girl": same,
         "emitted": len(records),
+        "tokens": tokens,
+        "by_user": by_user,
     }
     return records, stats
 
