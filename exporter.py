@@ -159,6 +159,7 @@ async def extract_chat(client, entity, limit, progress=None):
     """Pull the text history fast, normalized into chronological Msg records."""
     messages: list[Msg] = []
     count = 0
+    tokens = 0
     async for m in client.iter_messages(entity, limit=(limit or None)):
         if _BUSY["cancel"]:
             break
@@ -174,8 +175,9 @@ async def extract_chat(client, entity, limit, progress=None):
             reply_to=m.reply_to_msg_id,
         ))
         count += 1
+        tokens += formatters.approx_tokens(text)
         if progress and count % 1000 == 0:
-            await progress(count)
+            await progress(count, tokens)
     messages.reverse()  # oldest -> newest for correct pairing
     return messages
 
@@ -238,9 +240,10 @@ async def do_export(client, status_msg, target_raw, pair_limit):
     chat_id = getattr(entity, "id", target)
     await status_msg.edit(f"Extracting <b>{_esc(title)}</b> …", parse_mode="html")
 
-    async def progress(n):
+    async def progress(n, toks):
         await status_msg.edit(
-            f"Extracting <b>{_esc(title)}</b> … <b>{n:,}</b> messages",
+            f"Extracting <b>{_esc(title)}</b> … <b>{n:,}</b> messages\n"
+            f"Tokens Achieved Till Now : <b>{toks:,}</b>",
             parse_mode="html")
 
     messages = await extract_chat(client, entity, FETCH_LIMIT, progress)
