@@ -80,10 +80,11 @@ ALLOWED_USERS = {
 
 # Pairing / filtering knobs (mirror the from_telegram.py flags).
 FETCH_LIMIT = int(_env("FETCH_LIMIT", "0") or 0)     # messages to pull (0 = all)
-PAIR_LIMIT = int(_env("PAIR_LIMIT", "500") or 500)   # max pairs emitted
-MIN_WORDS = int(_env("MIN_WORDS", "3") or 3)
-MAX_CHARS = int(_env("MAX_CHARS", "300") or 300)
-PAIR_WINDOW = int(_env("PAIR_WINDOW", "600") or 600)  # seconds
+PAIR_LIMIT = int(_env("PAIR_LIMIT", "0") or 0)       # max pairs emitted (0 = all)
+MIN_WORDS = int(_env("MIN_WORDS", "1") or 1)         # 1 keeps short casual chat
+MAX_CHARS = int(_env("MAX_CHARS", "500") or 500)
+PAIR_WINDOW = int(_env("PAIR_WINDOW", "3600") or 3600)  # seconds
+PAIR_LOOKBACK = int(_env("PAIR_LOOKBACK", "60") or 60)  # max messages to scan back
 DROP_LINK_MSGS = str(_env("DROP_LINK_MSGS", "true")).lower() in ("1", "true", "yes")
 SAMPLE = str(_env("SAMPLE", "true")).lower() in ("1", "true", "yes")
 OUTPUT_FORMAT = _env("OUTPUT_FORMAT", "messages")     # messages | prompt_response
@@ -206,6 +207,7 @@ async def _stats_caption(client, messages, stats) -> str:
         lines.append(f"user {name} chat total : {totals.get(uid, 0)}")
     if len(GIRLS) > 25:
         lines.append(f"(+{len(GIRLS) - 25} more users)")
+    lines.append(f"pairs extracted : {stats['emitted']}")
     lines.append(f"total tokens extracted : {stats['tokens']}")
     lines.append("thanks for data")
     return "\n".join(lines)
@@ -239,6 +241,7 @@ async def do_export(client, status_msg, target_raw, pair_limit):
         messages, GIRLS,
         window=PAIR_WINDOW, min_words=MIN_WORDS, max_chars=MAX_CHARS,
         drop_links=DROP_LINK_MSGS, limit=pair_limit, sample=SAMPLE,
+        max_lookback=PAIR_LOOKBACK,
         system_prompt=SYSTEM_PROMPT, output_format=OUTPUT_FORMAT,
     )
     jsonl = formatters.records_to_jsonl(records)

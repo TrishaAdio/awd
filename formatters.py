@@ -187,12 +187,13 @@ def build_training_pairs(
     messages: list[Msg],
     girl_ids: set[int],
     *,
-    window: int = 600,
-    min_words: int = 3,
-    max_chars: int = 300,
+    window: int = 3600,
+    min_words: int = 1,
+    max_chars: int = 500,
     drop_links: bool = True,
-    limit: int = 500,
+    limit: int = 0,
     sample: bool = True,
+    max_lookback: int = 60,
     system_prompt: str = "",
     output_format: str = "messages",
     seed: int | None = None,
@@ -200,9 +201,14 @@ def build_training_pairs(
     """Build prompt->response pairs where the response author is a girl.
 
     `messages` must be chronological (oldest first). Returns (records, stats).
+
+    Timestamps are parsed once up front (not per comparison) and the reply
+    search looks back at most `max_lookback` messages, so this stays roughly
+    O(n) even on very large chats.
     """
     girl_ids = {int(g) for g in girl_ids}
     by_id = {m.id: m for m in messages}
+    epochs = [_epoch(m.date) for m in messages]   # parse dates ONCE
     filt = dict(min_words=min_words, max_chars=max_chars, drop_links=drop_links)
 
     pairs: list[tuple[Msg, Msg]] = []
@@ -218,14 +224,16 @@ def build_training_pairs(
             cand = by_id[resp.reply_to]
             if cand.sender_id != resp.sender_id and passes_filters(cand.text, **filt):
                 prompt = cand
-        # 2) most recent different-author message within the time window
+        # 2) most recent different-author message within the time/step window
         if prompt is None:
-            ts_r = _epoch(resp.date)
-            for j in range(i - 1, -1, -1):
-                cand = messages[j]
-                ts_c = _epoch(cand.date)
+            ts_r = epochs[i]
+            start = i - 1
+            stop = max(-1, i - 1 - max_lookback)
+            for j in range(start, stop, -1):
+                ts_c = epochs[j]
                 if ts_r is not None and ts_c is not None and (ts_r - ts_c) > window:
                     break
+                cand = messages[j]
                 if cand.sender_id == resp.sender_id:
                     continue
                 if not passes_filters(cand.text, **filt):
