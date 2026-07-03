@@ -224,33 +224,85 @@ async def _stats_caption(client, title, messages, stats) -> str:
     )
 
 
-async def do_export(client, status_msg, target_raw, pair_limit):
+def _raw_path(chat_id) -> str:
+    return os.path.join(EXPORT_DIR, f"raw_{chat_id}.jsonl")
+
+
+def save_raw(chat_id, messages) -> None:
+    """Cache every fetched message so we can re-pair later with NO re-download."""
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    with open(_raw_path(chat_id), "w", encoding="utf-8") as f:
+        for m in messages:
+            f.write(json.dumps(m.as_record(), ensure_ascii=False) + "\n")
+
+
+def load_raw(chat_id):
+    path = _raw_path(chat_id)
+    if not os.path.isfile(path):
+        return None
+    msgs = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                msgs.append(Msg(**json.loads(line)))
+    return msgs
+
+
+async def do_export(client, status_msg, target_raw, pair_limit, source="auto"):
+    """source: 'auto' = use cache if present else fetch; 'fresh' = always fetch
+    and refresh cache; 'cache' = only use cache (never touch the network)."""
     if not GIRLS:
         await status_msg.edit(f"No users registered. Add ids first: {PREFIX}addusers <id> <id> ...")
         return
 
     target = _parse_target(target_raw)
+    entity, title, chat_id = None, None, None
     try:
         entity = await client.get_entity(target)
+        title = _display_name(entity)
+        chat_id = getattr(entity, "id", target)
     except Exception as e:
-        await status_msg.edit(f"Could not resolve {target_raw}: {e}")
-        return
+        if isinstance(target, int):        # offline re-pair by numeric id still works
+            chat_id, title = target, f"chat {target}"
+        else:
+            await status_msg.edit(f"Could not resolve {target_raw}: {e}")
+            return
 
-    title = _display_name(entity)
-    chat_id = getattr(entity, "id", target)
-    await status_msg.edit(f"Extracting <b>{_esc(title)}</b> …", parse_mode="html")
+    cached = None if source == "fresh" else load_raw(chat_id)
 
-    async def progress(n, toks):
+    if cached is not None:
+        messages = cached
         await status_msg.edit(
-            f"Extracting <b>{_esc(title)}</b> … <b>{n:,}</b> messages\n"
-            f"Tokens Achieved Till Now : <b>{toks:,}</b>",
+            f"Re-pairing <b>{_esc(title)}</b> from cache … <b>{len(messages):,}</b> messages",
             parse_mode="html")
+    else:
+        if source == "cache":
+            await status_msg.edit(
+                f"No cache for <code>{chat_id}</code>. Run {PREFIX}export or {PREFIX}rescan first.",
+                parse_mode="html")
+            return
+        if entity is None:
+            await status_msg.edit(f"Could not resolve {target_raw} to fetch.")
+            return
 
-    messages = await extract_chat(client, entity, FETCH_LIMIT, progress)
-    if _BUSY["cancel"]:
-        await status_msg.edit("Cancelled.")
-        return
+        async def progress(n, toks):
+            await status_msg.edit(
+                f"Extracting <b>{_esc(title)}</b> … <b>{n:,}</b> messages\n"
+                f"Tokens Achieved Till Now : <b>{toks:,}</b>",
+                parse_mode="html")
 
+        messages = await extract_chat(client, entity, FETCH_LIMIT, progress)
+        if _BUSY["cancel"]:
+            await status_msg.edit("Cancelled.")
+            return
+        save_raw(chat_id, messages)      # never lose this scan again
+
+    await _finish(client, status_msg, title, chat_id, messages, pair_limit)
+
+
+async def _finish(client, status_msg, title, chat_id, messages, pair_limit):
+    """Pair -> write file -> upload. Pure CPU + disk; runs offline from cache."""
     records, stats = formatters.build_training_pairs(
         messages, GIRLS,
         window=PAIR_WINDOW, min_words=MIN_WORDS, max_chars=MAX_CHARS,
@@ -284,21 +336,23 @@ async def do_export(client, status_msg, target_raw, pair_limit):
 
 HELP_TEXT = (
     "Yor training extractor\n\n"
-    f"{PREFIX}addusers <id> <id> ...  register target users and extract this chat\n"
-    f"{PREFIX}rmusers <id> ...         unregister ids\n"
-    f"{PREFIX}users                    show the registered users\n"
-    f"{PREFIX}clearusers               clear the set\n"
-    f"{PREFIX}export <chat> [limit]    extract a specific chat (id / @username / link)\n"
-    f"{PREFIX}cancel                   stop a running extraction\n\n"
-    "Add the bot to a group, then /addusers the ids there. Reply turns come only "
-    "from those users (others -> them, and them -> each other); never other->other."
+    f"{PREFIX}addusers <id> ...   register targets + extract this chat (uses cache if present)\n"
+    f"{PREFIX}rmusers <id> ...    unregister ids\n"
+    f"{PREFIX}users               show the registered users\n"
+    f"{PREFIX}clearusers          clear the set\n"
+    f"{PREFIX}export <chat>       extract (re-pairs from cache if it exists, else downloads)\n"
+    f"{PREFIX}repair <chat>       re-build from cache only, offline, instant (no re-scan)\n"
+    f"{PREFIX}rescan <chat>       force a fresh download and refresh the cache\n"
+    f"{PREFIX}cancel              stop a running extraction\n\n"
+    "First run downloads and CACHES every message; after that, /repair rebuilds "
+    "the dataset with your current filters instantly, no re-download."
 )
 
 
 # --------------------------------------------------------------------------- #
 # Command handling
 # --------------------------------------------------------------------------- #
-async def run_export(client, event, target_raw, pair_limit):
+async def run_export(client, event, target_raw, pair_limit, source="auto"):
     if _BUSY["running"]:
         await event.reply(f"An extraction is already running. Send {PREFIX}cancel first.")
         return
@@ -306,7 +360,7 @@ async def run_export(client, event, target_raw, pair_limit):
     _BUSY["cancel"] = False
     status = await event.reply("Starting ...")
     try:
-        await do_export(client, status, target_raw, pair_limit)
+        await do_export(client, status, target_raw, pair_limit, source)
     except Exception as e:
         await status.edit(f"Extraction failed: {e}")
     finally:
@@ -372,13 +426,14 @@ async def _handle(event, client, allowed_ids):
             await event.reply("Nothing is running.")
         return
 
-    if cmd == "export":
+    if cmd in ("export", "rescan", "repair"):
         if not args:
-            await event.reply(f"Usage: {PREFIX}export <chat id / @username / link> [limit]")
+            await event.reply(f"Usage: {PREFIX}{cmd} <chat id / @username / link> [limit]")
             return
         target_raw = args[0]
         limit = int(args[1]) if len(args) >= 2 and args[1].isdigit() else PAIR_LIMIT
-        await run_export(client, event, target_raw, limit)
+        source = {"export": "auto", "rescan": "fresh", "repair": "cache"}[cmd]
+        await run_export(client, event, target_raw, limit, source)
         return
 
 
