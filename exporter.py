@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import getpass
+import html
 import json
 import os
 import sys
@@ -194,23 +195,31 @@ async def _safe_name(client, uid) -> str:
     return name
 
 
-async def _stats_caption(client, messages, stats) -> str:
-    """Per-user chat totals + total tokens, in the requested style."""
+def _esc(s) -> str:
+    return html.escape(str(s), quote=False)
+
+
+async def _stats_caption(client, title, messages, stats) -> str:
+    """HTML caption: per-user chat totals in a blockquote + pairs/tokens."""
     totals: dict[int, int] = {}
     for m in messages:
         if m.sender_id in GIRLS:
             totals[m.sender_id] = totals.get(m.sender_id, 0) + 1
 
-    lines = []
+    rows = []
     for uid in sorted(GIRLS, key=lambda u: totals.get(u, 0), reverse=True)[:25]:
-        name = await _safe_name(client, uid)
-        lines.append(f"user {name} chat total : {totals.get(uid, 0)}")
+        name = _esc(await _safe_name(client, uid))
+        rows.append(f"{name} — <b>{totals.get(uid, 0):,}</b> msgs")
     if len(GIRLS) > 25:
-        lines.append(f"(+{len(GIRLS) - 25} more users)")
-    lines.append(f"pairs extracted : {stats['emitted']}")
-    lines.append(f"total tokens extracted : {stats['tokens']}")
-    lines.append("thanks for data")
-    return "\n".join(lines)
+        rows.append(f"(+{len(GIRLS) - 25} more)")
+
+    return (
+        f"<b>{_esc(title)}</b>\n"
+        f"<blockquote>{chr(10).join(rows)}</blockquote>\n"
+        f"pairs extracted: <b>{stats['emitted']:,}</b>\n"
+        f"tokens collected: <b>{stats['tokens']:,}</b>\n"
+        f"thanks for data"
+    )
 
 
 async def do_export(client, status_msg, target_raw, pair_limit):
@@ -227,10 +236,12 @@ async def do_export(client, status_msg, target_raw, pair_limit):
 
     title = _display_name(entity)
     chat_id = getattr(entity, "id", target)
-    await status_msg.edit(f"Extracting {title} ...")
+    await status_msg.edit(f"Extracting <b>{_esc(title)}</b> …", parse_mode="html")
 
     async def progress(n):
-        await status_msg.edit(f"Extracting {title} ... {n} messages")
+        await status_msg.edit(
+            f"Extracting <b>{_esc(title)}</b> … <b>{n:,}</b> messages",
+            parse_mode="html")
 
     messages = await extract_chat(client, entity, FETCH_LIMIT, progress)
     if _BUSY["cancel"]:
@@ -258,13 +269,14 @@ async def do_export(client, status_msg, target_raw, pair_limit):
         )
         return
 
-    caption = await _stats_caption(client, messages, stats)
+    caption = await _stats_caption(client, title, messages, stats)
     try:
         await client.send_file(status_msg.chat_id, out_path, caption=caption,
-                               force_document=True)
+                               parse_mode="html", force_document=True)
         await status_msg.delete()
     except Exception as e:
-        await status_msg.edit(f"{caption}\n(saved to {out_path}; upload failed: {e})")
+        await status_msg.edit(f"{caption}\n<blockquote>saved to {_esc(out_path)}; "
+                              f"upload failed: {_esc(e)}</blockquote>", parse_mode="html")
 
 
 HELP_TEXT = (
